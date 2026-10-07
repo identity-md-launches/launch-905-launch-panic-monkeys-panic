@@ -60,12 +60,17 @@ contract PanicHookBucketsTest is PanicTestBase {
         _assertBucketsBackedByClaims();
     }
 
-    function testFuzz_splitOfAnyFeeSumsExactly(uint128 fee) public view {
-        uint256 toDonate = uint256(fee) * hook.LP_SHARE_BPS() / 10_000;
-        uint256 toBurn = uint256(fee) * hook.BURN_SHARE_BPS() / 10_000;
-        uint256 toOracle = uint256(fee) - toDonate - toBurn;
-        assertEq(toOracle + toDonate + toBurn, fee);
-        assertGe(toOracle, uint256(fee) * hook.ORACLE_SHARE_BPS() / 10_000);
+    /// forge-config: default.fuzz.runs = 1000
+    function testFuzz_splitOfAnyFeeSumsExactly(uint128 amountSeed) public {
+        _sellPanic(bound(amountSeed, 1, 2000 ether));
+        uint256 fee = _feesWithDonations();
+        uint256 lp = hook.totalDonated() + hook.donationBucket();
+        uint256 burn = hook.burnBucket();
+        assertEq(lp, fee * 3 / 10);
+        assertEq(burn, fee / 10);
+        assertEq(hook.oracleFundBucket(), fee - lp - burn);
+        assertEq(_claimBalance() + hook.totalDonated(), fee, "no unbacked allocations or lost claims");
+        assertEq(address(hook).balance, 0);
     }
 
     // ---------------------------------------------------------------- oracle fund
