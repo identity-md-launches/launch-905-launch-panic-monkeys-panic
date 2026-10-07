@@ -1,0 +1,32 @@
+{
+  "kind": "univ4_hook",
+  "hook": {
+    "contract": "PanicHook",
+    "constructorArgs": [
+      "$poolManager",
+      "$token",
+      "0x0000000000000000000000000000000000000000"
+    ],
+    "permissions": [
+      "beforeInitialize",
+      "afterInitialize",
+      "beforeSwap",
+      "afterSwap",
+      "beforeSwapReturnDelta",
+      "afterSwapReturnDelta"
+    ]
+  },
+  "token": {
+    "contract": "PanicMonkeys",
+    "name": "Panic Monkeys",
+    "symbol": "PANIC",
+    "decimals": 18
+  },
+  "pool": {
+    "pairedCurrency": "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7",
+    "fee": 12500,
+    "tickSpacing": 250,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "BLOCKED: the paying wallet address was not supplied. constructorArgs[2] is an explicit zero-address sentinel, which PanicHook rejects with ZeroAddress. Replace it with the verified paying wallet before this manifest can deploy; $payer is unsupported. Constructor order is (IPoolManager poolManager_, address panic_, address oracleFund_). No actual Oracle Fund beneficiary has been selected. The hook accepts the listed static LP fee 12500. It binds the first pool containing PANIC, rejects dynamic fees and subsequent pools, and supports either ERC-20 currency ordering. Tick spacing 250 and initial sqrtPriceX96 2^96 follow the deployment test; the initial price means one raw currency1 unit per raw currency0 unit, without adjusting for paired-token decimals. The manifest selects the requested ERC-20 pair; the repository deployment script instead initializes a native-ETH pool and does not implement this manifest's pool selection. Permissions match getHookPermissions, with address mask 0x30cc. Enabled callbacks and unlockCallback accept only PoolManager. The implementation uses Cancun transient storage and has no owner, pause, upgrade or setters for economic constants. Reference: a 3600-second geometric TWAP from cumulative ticks, at most one pre-first-swap observation per block; the initialization tick fills prelaunch history. Buys use pre-buy drawdown: 0% below 5%, 1% at or above 5%. Sells use post-sell drawdown: 2% below 5%, 10% from 5% to below 15%, 20% from 15% to below 30%, 30% from 30%. Fees are in the paired currency, additional to the 1.25% LP fee, and accrue as ERC-6909 claims. Exact-input buys charge through beforeSwap return delta; exact-output buys charge paired input through afterSwap return delta. Exact-input sells charge paired output through afterSwap; exact-output sells revert. Each fee assigns floor(30%) to LPs, floor(10%) to burning, and the remainder to the Oracle Fund, totaling 100% without unallocated split dust. Anyone can call claimOracleFund to the immutable recipient, donateToLiquidityProviders via PoolManager.donate, or buybackAndBurn. Buybacks spend at most 1000000000000000000 paired-token minor units per call (or a smaller caller limit), send purchased PANIC directly to 0x000000000000000000000000000000000000dEaD, restore unspent budget, and revert below 98% of reference-implied output. Review limitation: the general anti-splitting requirement is not met when pieces traverse fee tiers; early pieces pay lower rates. Existing splitting tests cover selected same-tier paths with a 10-unit rounding allowance. PoolManager skips callbacks for the hook's own buyback swaps, so those swaps pay no hook fee. These implementation limitations require review; this manifest does not resolve them."
+}
