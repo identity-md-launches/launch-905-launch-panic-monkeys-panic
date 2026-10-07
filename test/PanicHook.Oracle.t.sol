@@ -51,13 +51,29 @@ contract PanicHookOracleTest is PanicTestBase {
     function test_blocksSharingATimestampDoNotDuplicateObservations() public {
         _nextBlock(5);
         _sellPanic(1 ether);
+        assertEq(hook.lastObservedBlock(), START_BLOCK + 1);
         assertEq(hook.observationCount(), 2);
-        vm.roll(block.number + 1); // same timestamp, next block
+        uint160 referenceBefore = hook.referenceSqrtPriceX96();
+        int24 nextBlockTick = _tick();
+        (uint32 timestampBefore, int56 cumulativeBefore) = hook.observations(1);
+
+        // Explicit height: via-IR may reuse block.number across cheatcode calls within this test.
+        vm.roll(START_BLOCK + 2); // same timestamp, next block
+        assertEq(vm.getBlockNumber(), START_BLOCK + 2);
+        assertEq(vm.getBlockTimestamp(), timestampBefore, "the two blocks share a timestamp");
         _sellPanic(1 ether);
         assertEq(hook.observationCount(), 2, "no zero-length observation");
-        assertEq(hook.lastObservedBlock(), block.number, "but the block still counts as observed");
+        assertEq(hook.lastObservedBlock(), START_BLOCK + 2, "but the block still counts as observed");
+        assertEq(hook.lastObservedTick(), nextBlockTick, "the new block captures its pre-swap tick");
+        assertEq(hook.referenceSqrtPriceX96(), referenceBefore, "zero elapsed time cannot move the reference");
+        (uint32 timestampAfter, int56 cumulativeAfter) = hook.observations(1);
+        assertEq(timestampAfter, timestampBefore);
+        assertEq(cumulativeAfter, cumulativeBefore, "the existing observation is unchanged");
+
         _sellPanic(1 ether);
         assertEq(hook.observationCount(), 2);
+        assertEq(hook.lastObservedTick(), nextBlockTick, "later swaps cannot replace the pre-swap tick");
+        assertEq(hook.referenceSqrtPriceX96(), referenceBefore);
     }
 
     // ---------------------------------------------------------------- reference is immune to this block
