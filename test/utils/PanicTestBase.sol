@@ -265,6 +265,11 @@ abstract contract PanicTestBase is Test {
         return uint256(int256(_pairedAmount(delta))) + fee;
     }
 
+    /// @dev Fees still held plus the LP share already paid (compare between swaps, before outlets).
+    function _feesWithDonations() internal view returns (uint256) {
+        return hook.totalAccruedFees() + hook.totalDonated();
+    }
+
     function _claimBalance() internal view returns (uint256) {
         return manager.balanceOf(address(hook), paired.toId());
     }

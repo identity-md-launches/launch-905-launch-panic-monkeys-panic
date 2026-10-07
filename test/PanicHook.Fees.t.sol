@@ -81,9 +81,9 @@ contract PanicHookFeesTest is PanicTestBase {
     // ---------------------------------------------------------------- sells, judged after the sell
 
     function test_sellWhileNotDownPays2PercentOfOutput() public {
-        uint256 before = hook.totalAccruedFees();
+        uint256 before = _feesWithDonations();
         BalanceDelta d = _sellPanic(1 ether);
-        uint256 fee = hook.totalAccruedFees() - before;
+        uint256 fee = _feesWithDonations() - before;
         assertLt(hook.currentDrawdownBps(), 500, "a 1 PANIC sell barely moves this pool");
         uint256 gross = _grossOutput(d, fee);
         assertEq(fee, gross * 200 / 10_000, "2% of gross output");
@@ -91,9 +91,9 @@ contract PanicHookFeesTest is PanicTestBase {
     }
 
     function test_sellEndingBetween5And15PercentDownPays10Percent() public {
-        uint256 before = hook.totalAccruedFees();
+        uint256 before = _feesWithDonations();
         BalanceDelta d = _sellToDrawdown(800);
-        uint256 fee = hook.totalAccruedFees() - before;
+        uint256 fee = _feesWithDonations() - before;
         uint256 dd = hook.currentDrawdownBps();
         assertGe(dd, 500);
         assertLt(dd, 1500);
@@ -102,9 +102,9 @@ contract PanicHookFeesTest is PanicTestBase {
 
     function test_sellMovingPriceFromNotDownTo20PercentDownPays20Percent() public {
         assertEq(hook.currentDrawdownBps(), 0, "starts not down");
-        uint256 before = hook.totalAccruedFees();
+        uint256 before = _feesWithDonations();
         BalanceDelta d = _sellToDrawdown(2000);
-        uint256 fee = hook.totalAccruedFees() - before;
+        uint256 fee = _feesWithDonations() - before;
         uint256 dd = hook.currentDrawdownBps();
         assertGe(dd, 2000);
         assertLt(dd, 2010, "landed right at 20% down");
@@ -115,9 +115,9 @@ contract PanicHookFeesTest is PanicTestBase {
     }
 
     function test_sellEnding30PercentOrMoreDownPays30PercentAndNoMore() public {
-        uint256 before = hook.totalAccruedFees();
+        uint256 before = _feesWithDonations();
         BalanceDelta d = _sellToDrawdown(4500);
-        uint256 fee = hook.totalAccruedFees() - before;
+        uint256 fee = _feesWithDonations() - before;
         assertGe(hook.currentDrawdownBps(), 3000);
         uint256 gross = _grossOutput(d, fee);
         assertEq(fee, gross * 3000 / 10_000, "30% of gross output");
@@ -125,9 +125,9 @@ contract PanicHookFeesTest is PanicTestBase {
     }
 
     function test_hookFeeCappedAt30PercentEvenInACrash() public {
-        uint256 before = hook.totalAccruedFees();
+        uint256 before = _feesWithDonations();
         BalanceDelta d = _sellToDrawdown(9000);
-        uint256 fee = hook.totalAccruedFees() - before;
+        uint256 fee = _feesWithDonations() - before;
         assertGe(hook.currentDrawdownBps(), 9000);
         assertLe(fee * 10_000, _grossOutput(d, fee) * 3000, "capped at 30%");
     }
@@ -149,41 +149,40 @@ contract PanicHookFeesTest is PanicTestBase {
             assertEq(hook.drawdownBps(shy, ref, false), thresholds[i] - 1);
             assertEq(hook.drawdownBps(past, ref, false), thresholds[i]);
 
-            uint256 before = hook.totalAccruedFees();
+            uint256 before = _feesWithDonations();
             BalanceDelta d = _sellPanicToPrice(shy);
-            uint256 fee = hook.totalAccruedFees() - before;
+            uint256 fee = _feesWithDonations() - before;
             assertEq(_sqrtPrice(), shy, "pool stopped exactly at the limit");
             assertEq(fee, _grossOutput(d, fee) * tierBelow[i] / 10_000, "tier just below the threshold");
 
-            before = hook.totalAccruedFees();
+            before = _feesWithDonations();
             d = _sellPanicToPrice(past);
-            fee = hook.totalAccruedFees() - before;
+            fee = _feesWithDonations() - before;
             assertEq(_sqrtPrice(), past, "pool stopped exactly at the boundary");
             assertEq(fee, _grossOutput(d, fee) * tierAtOrPast[i] / 10_000, "tier at the threshold");
             vm.revertToState(snap);
         }
     }
 
-    /// @dev Splitting a dump into ten pieces does not lower the tax once the price is in the panic
-    /// region: every piece is judged on the price after it, against a reference none of them can move.
+    /// @dev This example stays inside one tier. It makes no claim about crossing tiers.
     /// Pool rounding may differ by a few wei between one swap and ten, so a 10 wei allowance is kept.
-    function test_splittingALargeSellIntoTenPaysAtLeastAsMuchTax() public {
+    function test_partitionWithinTwentyPercentTierHasOnlyRoundingDifference() public {
         // Already 16% down: the panic tiers apply to everything that follows.
         _sellToDrawdown(1600);
         uint256 amount = 200 ether;
 
         uint256 snap = vm.snapshotState();
-        uint256 before = hook.totalAccruedFees();
+        uint256 before = _feesWithDonations();
         _sellPanic(amount);
-        uint256 singleFee = hook.totalAccruedFees() - before;
+        uint256 singleFee = _feesWithDonations() - before;
         uint256 singleDrawdown = hook.currentDrawdownBps();
         vm.revertToState(snap);
 
-        before = hook.totalAccruedFees();
+        before = _feesWithDonations();
         for (uint256 i = 0; i < 10; i++) {
             _sellPanic(amount / 10);
         }
-        uint256 splitFee = hook.totalAccruedFees() - before;
+        uint256 splitFee = _feesWithDonations() - before;
 
         assertGe(splitFee + 10, singleFee, "ten small sells pay at least the single sell's tax");
         assertEq(hook.currentDrawdownBps(), singleDrawdown, "same end price either way");
@@ -192,25 +191,25 @@ contract PanicHookFeesTest is PanicTestBase {
 
     /// @dev Same comparison deeper in: a single sell that ends past 30% versus ten slices that each end
     /// past 30%. Each slice is judged where it lands, so none can dodge the top tier.
-    function test_splittingDoesNotEscapeTheTopTier() public {
+    function test_partitionRemainingInTopTierHasOnlyRoundingDifference() public {
         _sellToDrawdown(3100);
         uint256 amount = 500 ether;
 
         uint256 snap = vm.snapshotState();
-        uint256 before = hook.totalAccruedFees();
+        uint256 before = _feesWithDonations();
         BalanceDelta d = _sellPanic(amount);
-        uint256 singleFee = hook.totalAccruedFees() - before;
+        uint256 singleFee = _feesWithDonations() - before;
         assertEq(singleFee, _grossOutput(d, singleFee) * 3000 / 10_000);
         vm.revertToState(snap);
 
-        before = hook.totalAccruedFees();
+        before = _feesWithDonations();
         for (uint256 i = 0; i < 10; i++) {
-            uint256 pieceBefore = hook.totalAccruedFees();
+            uint256 pieceBefore = _feesWithDonations();
             BalanceDelta piece = _sellPanic(amount / 10);
-            uint256 pieceFee = hook.totalAccruedFees() - pieceBefore;
+            uint256 pieceFee = _feesWithDonations() - pieceBefore;
             assertEq(pieceFee, _grossOutput(piece, pieceFee) * 3000 / 10_000, "each slice pays 30%");
         }
-        uint256 splitFee = hook.totalAccruedFees() - before;
+        uint256 splitFee = _feesWithDonations() - before;
         assertGe(splitFee + 10, singleFee);
     }
 
@@ -227,10 +226,10 @@ contract PanicHookFeesTest is PanicTestBase {
     // ---------------------------------------------------------------- buys, judged before the buy
 
     function test_buyWhileNotDownPaysNoHookFee() public {
-        uint256 before = hook.totalAccruedFees();
+        uint256 before = _feesWithDonations();
         uint256 ethBefore = address(this).balance;
         BalanceDelta d = _buyPanic(1 ether);
-        assertEq(hook.totalAccruedFees(), before, "no fee");
+        assertEq(_feesWithDonations(), before, "no fee");
         assertEq(ethBefore - address(this).balance, 1 ether, "paid exactly the input");
         assertEq(_pairedAmount(d), -1 ether);
         assertGt(d.amount1(), 0, "received PANIC");
@@ -238,11 +237,11 @@ contract PanicHookFeesTest is PanicTestBase {
 
     function test_buyWhileDownPays1PercentOfInput() public {
         _sellToDrawdown(1000);
-        uint256 before = hook.totalAccruedFees();
+        uint256 before = _feesWithDonations();
         uint256 ethBefore = address(this).balance;
         BalanceDelta d = _buyPanic(1 ether);
-        uint256 fee = hook.totalAccruedFees() - before;
-        assertEq(fee, 0.01 ether, "1% of the 1 ETH input");
+        uint256 fee = _feesWithDonations() - before;
+        assertEq(fee, uint256(1 ether) * 100 / 10_100, "1% of pool input, within the total budget");
         assertEq(ethBefore - address(this).balance, 1 ether, "the swapper pays the full input");
         assertEq(_pairedAmount(d), -1 ether, "input includes the hook fee");
     }
@@ -250,26 +249,30 @@ contract PanicHookFeesTest is PanicTestBase {
     function test_buyIsJudgedOnThePriceBeforeTheBuy() public {
         // 6% down before the buy: the buy pays 1% even though it lifts the price above the reference.
         _sellToDrawdown(600);
-        uint256 before = hook.totalAccruedFees();
+        uint256 before = _feesWithDonations();
         _buyPanic(2_000 ether);
         assertEq(hook.currentDrawdownBps(), 0, "the buy lifted the price above the reference");
-        assertEq(hook.totalAccruedFees() - before, 20 ether, "1% of the input, judged before the buy");
+        assertEq(
+            _feesWithDonations() - before,
+            uint256(2_000 ether) * 100 / 10_100,
+            "1% of pool input, judged before the buy"
+        );
 
         // 4% down before the buy: no fee, whatever the buy does to the price.
         uint256 snap = vm.snapshotState();
         vm.revertToState(snap);
         _sellToDrawdown(400);
-        before = hook.totalAccruedFees();
+        before = _feesWithDonations();
         _buyPanic(10 ether);
-        assertEq(hook.totalAccruedFees(), before, "not down before the buy: 0%");
+        assertEq(_feesWithDonations(), before, "not down before the buy: 0%");
     }
 
     function test_exactOutputBuyPaysFeeOnThePairedInput() public {
         _sellToDrawdown(1000);
-        uint256 before = hook.totalAccruedFees();
+        uint256 before = _feesWithDonations();
         uint256 ethBefore = address(this).balance;
         BalanceDelta d = _buyPanicExactOut(1 ether);
-        uint256 fee = hook.totalAccruedFees() - before;
+        uint256 fee = _feesWithDonations() - before;
         assertEq(d.amount1(), 1 ether, "got exactly the PANIC asked for");
         uint256 paid = uint256(-int256(d.amount0()));
         assertEq(ethBefore - address(this).balance, paid);
@@ -280,9 +283,9 @@ contract PanicHookFeesTest is PanicTestBase {
     }
 
     function test_exactOutputBuyWhileNotDownPaysNothing() public {
-        uint256 before = hook.totalAccruedFees();
+        uint256 before = _feesWithDonations();
         _buyPanicExactOut(1 ether);
-        assertEq(hook.totalAccruedFees(), before);
+        assertEq(_feesWithDonations(), before);
     }
 
     // ---------------------------------------------------------------- what the fee is taken in
@@ -291,7 +294,7 @@ contract PanicHookFeesTest is PanicTestBase {
         _sellToDrawdown(2000);
         _buyPanic(5 ether);
         _sellPanic(1 ether);
-        assertGt(hook.totalAccruedFees(), 0);
+        assertGt(_feesWithDonations(), 0);
         assertEq(_claimBalance(), hook.totalAccruedFees(), "claims in the paired currency back every bucket");
         assertEq(manager.balanceOf(address(hook), Currency.wrap(address(panic)).toId()), 0, "no PANIC claims");
         assertEq(panic.balanceOf(address(hook)), 0, "no PANIC held");
@@ -306,9 +309,9 @@ contract PanicHookFeesTest is PanicTestBase {
             panic.transfer(who[i], 1 ether);
             vm.startPrank(who[i]);
             panic.approve(address(swapRouter), type(uint256).max);
-            uint256 before = hook.totalAccruedFees();
+            uint256 before = _feesWithDonations();
             BalanceDelta d = _sellPanic(1 ether);
-            uint256 fee = hook.totalAccruedFees() - before;
+            uint256 fee = _feesWithDonations() - before;
             vm.stopPrank();
             assertEq(fee, _grossOutput(d, fee) * 1000 / 10_000, "10% for everyone");
         }
@@ -317,9 +320,9 @@ contract PanicHookFeesTest is PanicTestBase {
     function test_feeEventReportsDrawdownTierAndAmount() public {
         _sellToDrawdown(2000);
         vm.recordLogs();
-        uint256 before = hook.totalAccruedFees();
+        uint256 before = _feesWithDonations();
         _sellPanic(1 ether);
-        uint256 fee = hook.totalAccruedFees() - before;
+        uint256 fee = _feesWithDonations() - before;
 
         bytes32 sig = keccak256("HookFeeCharged(address,bool,uint256,uint256,uint256)");
         Vm.Log[] memory logs = vm.getRecordedLogs();

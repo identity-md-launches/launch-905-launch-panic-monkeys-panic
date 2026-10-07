@@ -51,13 +51,29 @@ contract PanicHookOracleTest is PanicTestBase {
     function test_blocksSharingATimestampDoNotDuplicateObservations() public {
         _nextBlock(5);
         _sellPanic(1 ether);
+        assertEq(hook.lastObservedBlock(), START_BLOCK + 1);
         assertEq(hook.observationCount(), 2);
-        vm.roll(block.number + 1); // same timestamp, next block
+        uint160 referenceBefore = hook.referenceSqrtPriceX96();
+        int24 nextBlockTick = _tick();
+        (uint32 timestampBefore, int56 cumulativeBefore) = hook.observations(1);
+
+        // Explicit height: via-IR may reuse block.number across cheatcode calls within this test.
+        vm.roll(START_BLOCK + 2); // same timestamp, next block
+        assertEq(vm.getBlockNumber(), START_BLOCK + 2);
+        assertEq(vm.getBlockTimestamp(), timestampBefore, "the two blocks share a timestamp");
         _sellPanic(1 ether);
         assertEq(hook.observationCount(), 2, "no zero-length observation");
-        assertEq(hook.lastObservedBlock(), block.number, "but the block still counts as observed");
+        assertEq(hook.lastObservedBlock(), START_BLOCK + 2, "but the block still counts as observed");
+        assertEq(hook.lastObservedTick(), nextBlockTick, "the new block captures its pre-swap tick");
+        assertEq(hook.referenceSqrtPriceX96(), referenceBefore, "zero elapsed time cannot move the reference");
+        (uint32 timestampAfter, int56 cumulativeAfter) = hook.observations(1);
+        assertEq(timestampAfter, timestampBefore);
+        assertEq(cumulativeAfter, cumulativeBefore, "the existing observation is unchanged");
+
         _sellPanic(1 ether);
         assertEq(hook.observationCount(), 2);
+        assertEq(hook.lastObservedTick(), nextBlockTick, "later swaps cannot replace the pre-swap tick");
+        assertEq(hook.referenceSqrtPriceX96(), referenceBefore);
     }
 
     // ---------------------------------------------------------------- reference is immune to this block
@@ -80,14 +96,14 @@ contract PanicHookOracleTest is PanicTestBase {
 
     function test_aCrashInThisBlockIsJudgedAgainstTheUntouchedReference() public {
         _nextBlock(12);
-        uint256 before = hook.totalAccruedFees();
+        uint256 before = _feesWithDonations();
         BalanceDelta d = _sellToDrawdown(2000);
-        uint256 fee = hook.totalAccruedFees() - before;
+        uint256 fee = _feesWithDonations() - before;
         assertEq(fee, _grossOutput(d, fee) * 2000 / 10_000);
         // A second seller in the same block faces the same reference and is now deeper.
-        before = hook.totalAccruedFees();
+        before = _feesWithDonations();
         d = _sellToDrawdown(3100);
-        fee = hook.totalAccruedFees() - before;
+        fee = _feesWithDonations() - before;
         assertEq(fee, _grossOutput(d, fee) * 3000 / 10_000);
     }
 
@@ -133,14 +149,14 @@ contract PanicHookOracleTest is PanicTestBase {
         assertEq(hook.referenceTick(), _tick(), "reference equals the flat price");
         assertEq(hook.currentDrawdownBps(), 0);
 
-        uint256 before = hook.totalAccruedFees();
+        uint256 before = _feesWithDonations();
         BalanceDelta d = _sellPanic(1 ether);
-        uint256 fee = hook.totalAccruedFees() - before;
+        uint256 fee = _feesWithDonations() - before;
         assertEq(fee, _grossOutput(d, fee) * 200 / 10_000, "base 2% sell fee again");
 
-        before = hook.totalAccruedFees();
+        before = _feesWithDonations();
         _buyPanic(1 ether);
-        assertEq(hook.totalAccruedFees(), before, "buys are free again");
+        assertEq(_feesWithDonations(), before, "buys are free again");
     }
 
     function test_panicTierStillAppliesBeforeTheHourIsUp() public {
@@ -150,9 +166,9 @@ contract PanicHookOracleTest is PanicTestBase {
         uint256 dd = hook.currentDrawdownBps();
         assertGe(dd, 900);
         assertLt(dd, 1200);
-        uint256 before = hook.totalAccruedFees();
+        uint256 before = _feesWithDonations();
         BalanceDelta d = _sellPanic(1 ether);
-        uint256 fee = hook.totalAccruedFees() - before;
+        uint256 fee = _feesWithDonations() - before;
         assertEq(fee, _grossOutput(d, fee) * 1000 / 10_000, "10% tier");
     }
 
