@@ -43,14 +43,15 @@ contract PanicHookBucketsTest is PanicTestBase {
     }
 
     function test_everyFeeIsSplitExactlyWithNoDust() public {
-        uint256 before = hook.totalAccruedFees();
+        uint256 before = _feesWithDonations();
         _sellToDrawdown(2000);
-        uint256 fee = hook.totalAccruedFees() - before;
+        uint256 fee = _feesWithDonations() - before;
         assertGt(fee, 0);
-        assertEq(hook.donationBucket(), fee * 3000 / 10_000);
+        assertEq(hook.donationBucket(), 0);
+        assertEq(hook.totalDonated(), fee * 3000 / 10_000);
         assertEq(hook.burnBucket(), fee * 1000 / 10_000);
-        assertEq(hook.oracleFundBucket(), fee - hook.donationBucket() - hook.burnBucket());
-        assertEq(hook.oracleFundBucket() + hook.donationBucket() + hook.burnBucket(), fee, "sums to the fee exactly");
+        assertEq(hook.oracleFundBucket(), fee - hook.totalDonated() - hook.burnBucket());
+        assertEq(_feesWithDonations(), fee, "sums to the fee exactly");
         _assertBucketsBackedByClaims();
 
         // Odd amounts: the integer remainder lands in the oracle fund, nothing is lost.
@@ -114,32 +115,23 @@ contract PanicHookBucketsTest is PanicTestBase {
 
     // ---------------------------------------------------------------- donation
 
-    function test_donateSendsTheBucketToInRangeLiquidityProviders() public {
-        _sellToDrawdown(2000);
-        uint256 amount = hook.donationBucket();
-        assertGt(amount, 0);
+    function test_swapDonatesImmediatelyToInRangeLiquidityProviders() public {
         (uint256 growth0Before,) = IPoolManager(address(manager)).getFeeGrowthGlobals(poolId);
         uint128 liquidity = IPoolManager(address(manager)).getLiquidity(poolId);
-        uint256 claimsBefore = _claimBalance();
-
-        vm.prank(trader);
-        uint256 donated = hook.donateToLiquidityProviders();
-
-        assertEq(donated, amount);
+        _sellToDrawdown(2000);
+        uint256 amount = hook.totalDonated();
+        assertGt(amount, 0);
         (uint256 growth0After,) = IPoolManager(address(manager)).getFeeGrowthGlobals(poolId);
-        assertEq(growth0After - growth0Before, (amount << 128) / liquidity, "fee growth credited to LPs");
+        assertEq(growth0After - growth0Before, (amount << 128) / liquidity, "fee growth credited during swap");
         assertEq(hook.donationBucket(), 0);
-        assertEq(_claimBalance(), claimsBefore - amount);
         _assertBucketsBackedByClaims();
-
         vm.expectRevert(PanicHook.NothingToDonate.selector);
         hook.donateToLiquidityProviders();
     }
 
     function test_donationReachesTheLiquidityProviderOnWithdrawal() public {
         _sellToDrawdown(1000);
-        uint256 donation = hook.donationBucket();
-        hook.donateToLiquidityProviders();
+        uint256 donation = hook.totalDonated();
 
         // Removing a zero amount of liquidity collects fees owed to the position.
         uint256 ethBefore = address(this).balance;
@@ -162,22 +154,32 @@ contract PanicHookBucketsTest is PanicTestBase {
     }
 
     function test_donateRevertsWhileNoLiquidityIsInRangeAndKeepsTheBucket() public {
-        _sellToDrawdown(1000);
-        uint256 amount = hook.donationBucket();
-        // Remove the only position.
+        // Move all liquidity into a finite range, then sell through its upper boundary.
         lpRouter.modifyLiquidity(
             key,
-            ModifyLiquidityParams({
-                tickLower: TickMath.minUsableTick(TICK_SPACING),
-                tickUpper: TickMath.maxUsableTick(TICK_SPACING),
-                liquidityDelta: -int256(uint256(FULL_RANGE_LIQUIDITY)),
-                salt: 0
-            }),
+            ModifyLiquidityParams(
+                TickMath.minUsableTick(TICK_SPACING),
+                TickMath.maxUsableTick(TICK_SPACING),
+                -int256(uint256(FULL_RANGE_LIQUIDITY)),
+                0
+            ),
             ""
         );
+        _addLiquidity(-1000, 1000, FULL_RANGE_LIQUIDITY);
+        _sellPanicToPrice(TickMath.getSqrtPriceAtTick(1100));
+        assertEq(IPoolManager(address(manager)).getLiquidity(poolId), 0);
+        uint256 amount = hook.donationBucket();
+        assertGt(amount, 0, "only unreceivable donations wait");
         vm.expectRevert(Pool.NoLiquidityToReceiveFees.selector);
         hook.donateToLiquidityProviders();
         assertEq(hook.donationBucket(), amount, "bucket untouched");
+        _assertBucketsBackedByClaims();
+        _addFullRangeLiquidity(FULL_RANGE_LIQUIDITY);
+        uint256 claimsBefore = _claimBalance();
+        vm.prank(trader);
+        assertEq(hook.donateToLiquidityProviders(), amount);
+        assertEq(hook.donationBucket(), 0);
+        assertEq(_claimBalance(), claimsBefore - amount);
         _assertBucketsBackedByClaims();
     }
 
@@ -198,8 +200,9 @@ contract PanicHookBucketsTest is PanicTestBase {
         assertEq(panic.balanceOf(DEAD) - deadBefore, burned, "all bought PANIC ends at 0x...dEaD");
         assertEq(panic.balanceOf(address(hook)), 0);
         assertEq(panic.balanceOf(trader), 0, "the caller receives nothing");
-        assertEq(hook.burnBucket(), bucket - spent);
-        assertEq(_claimBalance(), claimsBefore - spent);
+        assertEq(hook.burnBucket(), bucket - spent + (spent * 100 / 10_100) / 10);
+        uint256 internalFee = spent * 100 / 10_100;
+        assertEq(_claimBalance(), claimsBefore - spent + internalFee - internalFee * 3000 / 10_000);
         _assertBucketsBackedByClaims();
         // 20% down, so the buy returned far more than the reference implied.
         uint256 implied = hook.pairedToPanicAtSqrtPrice(spent, hook.referenceSqrtPriceX96(), false);
@@ -207,14 +210,16 @@ contract PanicHookBucketsTest is PanicTestBase {
         assertGt(burned, implied, "cheaper than the reference while the price is down");
 
         // Keep going until the bucket is empty: everything bought lands at the dead address.
-        uint256 totalSpent = spent;
+        _nextBlock(3600); // no dip fee while draining the remainder at the now-flat price
+        uint256 remaining = hook.burnBucket();
+        uint256 totalSpent;
         uint256 totalBurned = burned;
         while (hook.burnBucket() > 0) {
             (spent, burned) = hook.buybackAndBurn();
             totalSpent += spent;
             totalBurned += burned;
         }
-        assertEq(totalSpent, bucket);
+        assertEq(totalSpent, remaining);
         assertEq(panic.balanceOf(DEAD) - deadBefore, totalBurned);
         assertEq(panic.balanceOf(address(hook)), 0);
         _assertBucketsBackedByClaims();
@@ -241,11 +246,12 @@ contract PanicHookBucketsTest is PanicTestBase {
 
         (uint256 spent,) = hook.buybackAndBurn();
         assertEq(spent, hook.MAX_BUYBACK_SPEND(), "capped");
-        assertEq(hook.burnBucket(), bucket - spent, "the rest waits for the next call");
+        assertEq(hook.burnBucket(), bucket - spent + (spent * 100 / 10_100) / 10, "remainder plus fee burn share");
+        uint256 remaining = hook.burnBucket();
 
         (spent,) = hook.buybackAndBurn(0.25 ether);
         assertEq(spent, 0.25 ether, "a caller may spend less than the cap");
-        assertEq(hook.burnBucket(), bucket - hook.MAX_BUYBACK_SPEND() - 0.25 ether);
+        assertEq(hook.burnBucket(), remaining - spent + (spent * 100 / 10_100) / 10);
 
         (spent,) = hook.buybackAndBurn(type(uint256).max);
         assertEq(spent, hook.MAX_BUYBACK_SPEND(), "but never more");
@@ -292,19 +298,25 @@ contract PanicHookBucketsTest is PanicTestBase {
         assertLt(burned, implied, "but below it, because of the LP fee");
     }
 
-    function test_buybackCannotMoveTheReferenceAndIsNotChargedTheHookFee() public {
+    function test_buybackCannotMoveTheReferenceAndPaysTheDipFee() public {
         _sellToDrawdown(2000);
         _nextBlock(12);
         uint160 ref = hook.referenceSqrtPriceX96();
         uint256 feesBefore = hook.totalAccruedFees();
         uint256 burnBefore = hook.burnBucket();
+        uint256 oracleBefore = hook.oracleFundBucket();
+        uint256 donatedBefore = hook.totalDonated();
         (uint256 spent,) = hook.buybackAndBurn();
+        uint256 fee = spent * 100 / 10_100;
+        uint256 lpShare = fee * 3000 / 10_000;
+        uint256 burnShare = fee * 1000 / 10_000;
         assertEq(hook.referenceSqrtPriceX96(), ref, "reference unchanged by the buyback");
-        assertEq(
-            hook.totalAccruedFees(), feesBefore - spent, "the manager skips hook callbacks for the hook's own swap"
-        );
-        assertEq(hook.burnBucket(), burnBefore - spent);
-        assertEq(hook.observationCount(), 2, "the buyback took this block's observation first");
+        assertEq(hook.totalAccruedFees(), feesBefore - spent + fee - lpShare);
+        assertEq(hook.oracleFundBucket(), oracleBefore + fee - lpShare - burnShare);
+        assertEq(hook.totalDonated(), donatedBefore + lpShare);
+        assertEq(hook.burnBucket(), burnBefore - spent + burnShare);
+        assertEq(hook.observationCount(), 2, "buyback took this block's observation first");
+        _assertBucketsBackedByClaims();
     }
 
     function test_buybackRevertsWhenThereIsNothingToSpend() public {
@@ -326,7 +338,8 @@ contract PanicHookBucketsTest is PanicTestBase {
         assertGt(hook.totalAccruedFees(), 0);
 
         hook.claimOracleFund();
-        hook.donateToLiquidityProviders();
+        assertEq(hook.donationBucket(), 0);
+        _nextBlock(3600);
         while (hook.burnBucket() > 0) {
             hook.buybackAndBurn();
         }
@@ -376,12 +389,12 @@ contract PanicHookBucketsTest is PanicTestBase {
         _nextBlock(12);
         _sellToDrawdown(1000);
         uint256 managerEth = address(manager).balance;
-        uint256 fee = 50 ether * 100 / 10_000;
+        uint256 fee = uint256(50 ether) * 100 / 10_100;
         assertGt(fee, managerEth, "the fee is larger than the manager's whole ETH balance");
         assertGe(hook.currentDrawdownBps(), 500, "down, so the buy is fee-bearing");
-        uint256 before = hook.totalAccruedFees();
+        uint256 before = _feesWithDonations();
         _buyPanic(50 ether);
-        assertEq(hook.totalAccruedFees() - before, fee, "1% fee credited as a claim");
+        assertEq(_feesWithDonations() - before, fee, "1% fee split between claims and immediate donation");
         assertEq(manager.balanceOf(address(hook), 0), hook.totalAccruedFees());
 
         // And the fund can be claimed now that the swapper's ETH has settled.

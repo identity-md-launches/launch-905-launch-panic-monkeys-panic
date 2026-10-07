@@ -152,6 +152,8 @@ contract PanicHook is IHooks, IUnlockCallback {
     uint256 public oracleFundBucket;
     uint256 public donationBucket;
     uint256 public burnBucket;
+    /// @notice Lifetime LP share already donated; not part of the outstanding claim balance.
+    uint256 public totalDonated;
 
     // ------------------------------------------------------------------------------------------------
     // Transient state passed from beforeSwap to afterSwap and into the unlock callback
@@ -191,6 +193,7 @@ contract PanicHook is IHooks, IUnlockCallback {
     error PoolMustContainPanic();
     error DynamicFeeNotSupported();
     error ExactOutputSellNotSupported();
+    error PartialExactInputBuyNotSupported();
     error NothingToClaim();
     error NothingToDonate();
     error NothingToBuyBack();
@@ -303,8 +306,9 @@ contract PanicHook is IHooks, IUnlockCallback {
             _tstore(TS_FEE_BPS, feeBps);
             _tstore(TS_DRAWDOWN, drawdown);
             if (params.amountSpecified < 0) {
-                // Exact input: the specified currency is the paired input. Take the fee from it here.
-                uint256 fee = uint256(-params.amountSpecified) * feeBps / BPS;
+                // The input budget includes the fee. Reserve at most 1% of the pool's net input.
+                // afterSwap refuses partial fills because it cannot refund the specified currency.
+                uint256 fee = uint256(-params.amountSpecified) * feeBps / (BPS + feeBps);
                 _tstore(TS_BEFORE_FEE, fee);
                 return (IHooks.beforeSwap.selector, toBeforeSwapDelta(fee.toInt128(), 0), 0);
             }
@@ -345,6 +349,10 @@ contract PanicHook is IHooks, IUnlockCallback {
             drawdown = _tload(TS_DRAWDOWN);
             if (params.amountSpecified < 0) {
                 feeAmount = _tload(TS_BEFORE_FEE);
+                uint256 input = pairedDelta < 0 ? uint256(-int256(pairedDelta)) : 0;
+                if (feeAmount > 0 && input + feeAmount != uint256(-params.amountSpecified)) {
+                    revert PartialExactInputBuyNotSupported();
+                }
             } else {
                 // Exact-output buy: the paired input is the (negative) unspecified delta.
                 uint256 input = pairedDelta < 0 ? uint256(uint128(-pairedDelta)) : 0;
@@ -487,7 +495,8 @@ contract PanicHook is IHooks, IUnlockCallback {
         if (spent < budget) burnBucket += budget - spent;
 
         uint256 implied = pairedToPanicAtSqrtPrice(spent, refSqrtPriceX96, panicIsCurrency0);
-        uint256 minimum = implied * MIN_BUYBACK_OUTPUT_BPS / BPS;
+        uint256 minimum = FullMath.mulDivRoundingUp(implied, MIN_BUYBACK_OUTPUT_BPS, BPS);
+        if (minimum == 0) minimum = 1;
         if (burned < minimum) revert BuybackBelowReference(burned, minimum);
         emit BuybackAndBurn(msg.sender, spent, burned, implied);
     }
@@ -503,18 +512,22 @@ contract PanicHook is IHooks, IUnlockCallback {
             return "";
         }
         if (action == ACTION_DONATE) {
-            (uint256 amount0, uint256 amount1) = panicIsCurrency0 ? (uint256(0), amount) : (amount, uint256(0));
-            poolManager.donate(poolKey, amount0, amount1, "");
-            poolManager.burn(address(this), paired.toId(), amount);
+            _donate(amount);
             return "";
         }
         if (action == ACTION_BUYBACK) {
+            // v4 skips callbacks on this hook's own swaps. Apply the same buy fee explicitly,
+            // reallocating existing claims instead of minting a second claim for the internal fee.
+            (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(poolId);
+            uint256 drawdown = drawdownBps(sqrtPriceX96, referenceSqrtPriceX96(), panicIsCurrency0);
+            uint256 feeBps = buyFeeBps(drawdown);
+            uint256 reservedFee = amount * feeBps / (BPS + feeBps);
             bool zeroForOne = !panicIsCurrency0; // paired -> PANIC
             BalanceDelta delta = poolManager.swap(
                 poolKey,
                 SwapParams({
                     zeroForOne: zeroForOne,
-                    amountSpecified: -amount.toInt256(),
+                    amountSpecified: -(amount - reservedFee).toInt256(),
                     sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
                 }),
                 ""
@@ -524,8 +537,12 @@ contract PanicHook is IHooks, IUnlockCallback {
             uint256 spent = pairedDelta < 0 ? uint256(uint128(-pairedDelta)) : 0;
             uint256 bought = panicDelta > 0 ? uint256(uint128(panicDelta)) : 0;
             if (spent > 0) poolManager.burn(address(this), paired.toId(), spent);
+            uint256 fee = spent * feeBps / BPS;
+            if (fee > reservedFee) fee = reservedFee;
+            if (fee > 0) _split(fee);
+            emit HookFeeCharged(address(this), true, drawdown, feeBps, fee);
             if (bought > 0) poolManager.take(Currency.wrap(panic), DEAD, bought);
-            return abi.encode(spent, bought);
+            return abi.encode(spent + fee, bought);
         }
         revert UnexpectedAction(action);
     }
@@ -546,7 +563,7 @@ contract PanicHook is IHooks, IUnlockCallback {
     }
 
     /// @notice The 1-hour reference price as a Q64.96 sqrt price.
-    function referenceSqrtPriceX96() external view returns (uint160) {
+    function referenceSqrtPriceX96() public view returns (uint160) {
         (int24 tick,) = _reference();
         return TickMath.getSqrtPriceAtTick(tick);
     }
@@ -649,6 +666,21 @@ contract PanicHook is IHooks, IUnlockCallback {
         oracleFundBucket += toOracle;
         donationBucket += toDonate;
         burnBucket += toBurn;
+        // Pay the liquidity present at the taxed swap's end, before a later caller can insert a
+        // position solely to collect this fee. Keep claims only if no liquidity can receive them.
+        uint256 pending = donationBucket;
+        if (pending > 0 && poolManager.getLiquidity(poolId) > 0) {
+            donationBucket = 0;
+            _donate(pending);
+            emit DonatedToLiquidityProviders(address(this), pending);
+        }
+    }
+
+    function _donate(uint256 amount) internal {
+        (uint256 amount0, uint256 amount1) = panicIsCurrency0 ? (uint256(0), amount) : (amount, uint256(0));
+        poolManager.donate(poolKey, amount0, amount1, "");
+        poolManager.burn(address(this), _paired().toId(), amount);
+        totalDonated += amount;
     }
 
     /// @dev Takes this block's observation if it has not been taken yet, refreshes the window-start hint,

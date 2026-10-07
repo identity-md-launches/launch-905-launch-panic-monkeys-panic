@@ -27,7 +27,11 @@ and the build needs no network.
   first swap of that block** (`_observe()` runs at the top of `beforeSwap` and of `buybackAndBurn`).
   Trades in the current block therefore cannot move the reference.
 * The reference tick is the arithmetic mean tick over the last 3,600 seconds (a geometric mean
-  price). The reference price is `TickMath.getSqrtPriceAtTick(referenceTick)`.
+  price), rounded toward negative infinity to a whole tick. The reference price is
+  `TickMath.getSqrtPriceAtTick(referenceTick)`. This quantizes the mean by less than one tick
+  (about 1 bp of price). With PANIC as currency1 it biases the reference upward; with PANIC
+  as currency0 it biases it downward. Tier exactness below is relative to this computed
+  reference, not an unquantized geometric mean. Fractional-tick interpolation is not implemented.
 * Before the pool's first block the launch (initialization) price is assumed to have prevailed, so
   the window is a full hour from the very first swap. Without this, a dump seconds after launch would
   drag the reference down almost immediately.
@@ -55,15 +59,20 @@ is detected at initialization and the math handles both.
 | Sell | price **after** the sell  | 2% | 10% | 20% | 30% |
 
 * Exact-input buys: the fee is taken from the paired input through the `beforeSwap` return delta.
+  The specified input is an all-in budget: `fee = floor(budget * rate / (10000 + rate))`, so
+  the fee is at most 1% of the pool input, with at most one minor unit of conservative rounding.
+  A fee-bearing partial fill reverts atomically with `PartialExactInputBuyNotSupported` in
+  `afterSwap`: v4 cannot refund the specified currency there. Price-limited buyers that need
+  partial fills must use exact-output buys; zero-fee partial buys remain supported.
 * Exact-output buys: the paired input is the unspecified currency, so the fee (1% of what the pool
   needed) is taken through the `afterSwap` return delta instead.
 * Exact-input sells: the fee is taken from the paired output through the `afterSwap` return delta.
 * Exact-output sells are **rejected** (`ExactOutputSellNotSupported`): the paired output is the
   specified amount, and a v4 hook cannot adjust the specified currency after the swap, which is the
   only moment the post-sell price is known. Routers must quote sells as exact input.
-* Nobody is exempt. The hook's own buyback swap is skipped by the PoolManager's callback rules
-  (hooks calling `swap` on their own pool get no callbacks), which is protocol behaviour, not an
-  exemption written here; it is covered by a test.
+* Nobody is exempt. The PoolManager skips callbacks on the hook's own swap, so the buyback
+  explicitly charges the pre-buy tier on the input actually consumed, splits the fee, and emits
+  `HookFeeCharged`. Existing claims are reallocated; the internal fee is not minted twice.
 * Fee amounts round down, so a fee is never more than 30% of the amount it is taken from.
 * The fee is credited to the hook as an ERC-6909 claim inside the swap (`poolManager.mint`). The
   swap never depends on the PoolManager already holding the paired currency, so a fee-bearing buy
@@ -77,31 +86,42 @@ three parts always sum to the fee exactly:
 | Bucket | Share | Outlet |
 | --- | --- | --- |
 | Panic Oracle Fund | 60% | `claimOracleFund()` burns the claims and `take`s the paired currency to the immutable `oracleFund` address (the paying wallet). Only that address can ever receive it. |
-| Liquidity providers | 30% | `donateToLiquidityProviders()` calls `PoolManager.donate` with the bucket, paying with the claims. Goes to liquidity in range at the moment of the call. Reverts (`NoLiquidityToReceiveFees`) while nothing is in range; the bucket waits. |
-| Burn | 10% | `buybackAndBurn()` / `buybackAndBurn(maxSpend)` spends `min(bucket, maxSpend, 1 ether)` on PANIC in this pool and `take`s every token bought straight to `0x000000000000000000000000000000000000dEaD`. Reverts with `BuybackBelowReference` if it would receive less than 98% of the PANIC the reference price implies for the amount spent. Anything above the cap waits for the next call. |
+| Liquidity providers | 30% | Donated inside the taxed swap to liquidity in range at its end using `PoolManager.donate`, funded by burning claims. Only when no liquidity is in range does `donationBucket` retain the share. Anyone can flush that fallback with `donateToLiquidityProviders()` once liquidity returns; otherwise it reverts (`NoLiquidityToReceiveFees`). The next taxed swap also flushes a pending donation when liquidity is available. |
+| Burn | 10% | `buybackAndBurn()` / `buybackAndBurn(maxSpend)` spends `min(bucket, maxSpend, 1 ether)` on PANIC in this pool and `take`s every token bought straight to `0x000000000000000000000000000000000000dEaD`. Reverts with `BuybackBelowReference` if it would receive less than 98% of the PANIC the reference price implies for the amount spent. The cap and reference floor include the internal buy fee. Anything above the cap waits for the next call. |
 
 The hook's claim balance always equals `oracleFundBucket + donationBucket + burnBucket`; the
-outlets drain the buckets to zero, so no dust stays stuck (tested).
+split allocates every minor unit, with no unassigned dust. `totalDonated` records the LP share
+already paid and is excluded from the claim balance and `totalAccruedFees()`. A buyback requires
+positive PANIC output and rounds its 98% minimum upward. Untradeably small burn balances stay
+accounted for until more fees accrue; wasting them on a zero-output swap is forbidden. Claim and
+donate impose no minimum amount.
 
 Because the buyback is checked against the reference and not the spot price, it only passes near a
 flat price when the LP fee plus impact stays under 2% (1.25% LP fee leaves 0.75% for impact), and
 it passes easily when the price is down. In a thin pool, call `buybackAndBurn(maxSpend)` with a
 smaller amount.
 
-### Anti-splitting
+### Unresolved anti-splitting requirement
 
-Each sell is judged on the price after it against a reference frozen for the block, so splitting a
-dump into pieces cannot reset the reference, and in the panic region every piece pays the tier its
-own end price lands in (`test_splittingALargeSellIntoTenPaysAtLeastAsMuchTax`,
-`test_splittingDoesNotEscapeTheTopTier`). One honest limitation follows directly from the brief's
-schedule: a sell that ends while the price is still less than 5% down pays 2%, by definition. So a
-seller who starts from a flat price and slices a dump into ten pieces pays the low tiers on the
-first slices and the high tiers on the later ones, less in total than one sell judged entirely at
-the final price. No per-sell schedule that charges "20% on a sell that ends 20% down" can avoid
-this; a path-based (marginal) tax would make the split pay the same, but would make that single
-sell pay a blend instead of 20%, contradicting the required 20% test. The tests therefore state the
-guarantee the design actually gives: once down, splitting never pays less (a 10 wei allowance covers
-pool rounding across ten swaps versus one).
+The required flat-start anti-splitting property is **not satisfied**. The supplied proof reproduces:
+one 1,200 PANIC sell pays 211.890925346446133214 ETH, while ten 120 PANIC sells pay
+116.773540169813521004 ETH, including the donated share in both measurements. Early slices
+end in lower tiers. The reference stays frozen, but that cannot make their mandated rates equal.
+
+For gross outputs `q_i` and prescribed post-sell rates `r_i`, the split fee is `sum(q_i * r_i)`;
+a single sell ending at rate `r_final` pays approximately `sum(q_i) * r_final`. If any earlier
+slice has `r_i < r_final`, the first sum is smaller. Charging the final tier retroactively would
+violate the stated per-sell schedule. Capping a catch-up fee at 30% does not solve this generally:
+a tiny sell crossing a threshold may owe more catch-up than 30% of its own output. A block's
+running deepest drawdown also cannot change fees already settled on earlier slices.
+
+This revision preserves the explicit per-sell tiers. Resolving the competing required test needs
+an economic specification change before launch (for example, a marginal schedule changes the
+required single-sell 20% result, while cumulative settlement changes the per-sell charges).
+`test_flatStartSplittingCounterexampleUnderTheSpecifiedTiers` records the unresolved conflict.
+`test_partitionWithinTwentyPercentTierHasOnlyRoundingDifference` and
+`test_partitionRemainingInTopTierHasOnlyRoundingDifference` test only partitions staying within
+one tier, with a 10 wei rounding tolerance. They do not prove general anti-splitting.
 
 ## Hook configuration (Wizard's canonical record)
 
@@ -203,31 +223,36 @@ Nothing in the hook runs by itself. Someone (the project, a keeper, or any volun
 permissionless and pay nothing to the caller) should periodically:
 
 1. call `claimOracleFund()` to move the Panic Oracle Fund to the paying wallet;
-2. call `donateToLiquidityProviders()` to pay LPs. Note that `PoolManager.donate` pays whoever is in
-   range at that moment, so a caller can add just-in-time liquidity before calling it; running it
-   often and at unpredictable times keeps each donation small;
+2. call `donateToLiquidityProviders()` only if the no-liquidity fallback bucket is nonzero.
+   Ordinary fees have already been donated during the swap. A position opened afterwards cannot
+   capture them. The fallback still pays whoever is in range when it is flushed and retains JIT
+   exposure; there was no in-range liquidity to receive it at the taxed swap's end. Immediate
+   donation also does not prevent liquidity added before a victim swap from earning its fees;
 3. call `buybackAndBurn()` repeatedly (1 ETH per call, 98%-of-reference floor) to burn the burn
    bucket. It reverts while the live price is more than about 2% above the reference, and may need
-   `buybackAndBurn(maxSpend)` with a smaller amount in thin liquidity. A sandwich around it is bounded
-   by the 1 ETH cap and is itself taxed by the sell tiers.
+   `buybackAndBurn(maxSpend)` with a smaller amount in thin liquidity. The cap is per call, not per
+   block or transaction: callers can loop and spend the available bucket. It does not bound a
+   sandwich to 1 ETH. The reference floor does not guarantee a quote close to spot during a crash.
+   A holder can provide PANIC-only liquidity for buybacks to consume and withdraw paired proceeds;
+   liquidity operations carry no hook sell tax. No aggregate rate limit or spot floor is promised.
 
 If the oracle budget address is a contract that rejects ETH, `claimOracleFund()` reverts and the
 bucket keeps accruing; swaps are never affected because fees are claims, not transfers. The address
 cannot be changed, so choose it carefully.
 
-Gas, measured against a hookless twin pool in the tests: about 122k extra gas for the first swap of
-a block (it writes the observation and the window hint) and about 56k for later swaps in the block.
+Immediate donation adds PoolManager accounting work to taxed swaps. Gas should be remeasured for
+the target chain; old pre-revision gas estimates do not cover this path.
 
 ## Tests
 
-`forge test` runs 88 tests (unit, integration on a real `PoolManager`, fuzz). Required behaviours and
-where they are proven:
+`forge test` runs unit, integration on a real `PoolManager`, and fuzz tests. Behaviours and their
+evidence (including the explicitly unresolved requirement):
 
 | Requirement | Test |
 | --- | --- |
 | tiers switch exactly at 5%, 15%, 30% | `test_sellTiersSwitchExactlyAt5_15_30Percent`, `test_buyTierSwitchesExactlyAt5Percent`, `test_drawdownIsExactAtThresholds`, `test_sellTiersSwitchAtExactBoundaryPrices` |
 | a sell from not-down to 20% down pays 20% | `test_sellMovingPriceFromNotDownTo20PercentDownPays20Percent` (+ ERC-20 pair variants) |
-| splitting a sell into 10 pays at least as much | `test_splittingALargeSellIntoTenPaysAtLeastAsMuchTax`, `test_splittingDoesNotEscapeTheTopTier` (see Anti-splitting) |
+| general anti-splitting | **Unresolved specification conflict**; `test_flatStartSplittingCounterexampleUnderTheSpecifiedTiers` reproduces lower split tax. Within-tier tests do not prove this property. |
 | a buy and a sell in the same block cannot move the reference | `test_buyAndSellInTheSameBlockCannotMoveTheReference`, `test_atMostOneObservationPerBlockTakenBeforeTheFirstSwap` |
 | down but flat for 1 hour: panic tier no longer applies | `test_afterAnHourDownButFlatThePanicTierNoLongerApplies`, `test_referenceIsTheOneHourMeanTick` |
 | fee split sums to exactly 100% | `test_feeSplitSumsToExactly100Percent`, `test_everyFeeIsSplitExactlyWithNoDust`, `testFuzz_splitOfAnyFeeSumsExactly` |
@@ -236,6 +261,9 @@ where they are proven:
 | initialization and unauthorized callbacks | `PanicHook.Init.t.sol` |
 | token supply and transfer | `PanicMonkeys.t.sol` |
 | fee-bearing buy on a fresh manager, tokens-only pool | `test_feeBearingBuyWorksOnAFreshManagerWhosePoolHoldsTokensOnly` |
+| limited buys never pay fees on unfilled input | `test_partialDipBuyRevertsWithoutChargingOrMovingThePool`, `test_exactOutputLimitedDipBuyChargesOnlyRealisedInput`, `testFuzz_fullDipBuyFeeIsAtMostOnePercentOfPoolInput` |
+| historical LP fees cannot be captured by later JIT liquidity | `test_jitPositionCannotCaptureAnEarlierSwapsDonation`, `test_donationReachesTheLiquidityProviderOnWithdrawal` |
+| buyback dip fee and dust floor | `test_buybackCannotMoveTheReferenceAndPaysTheDipFee`, `test_partialBuybackReallocatesFeeOnlyOnRealisedInput`, `test_dustBuybackRevertsAndPreservesAllFunds`, `testFuzz_tinyBuybacksNeverRoundAwayTheReferenceFloor` |
 | recipient that rejects ETH | `test_claimToARecipientThatRejectsEthFailsWithoutBlockingSwaps` |
 
 Tests read no environment variables and do not depend on the caller. They pass in any order and in
@@ -250,7 +278,9 @@ Checked against the `uniswap-v4-security` and `eth-security` references:
 * No owner, pause, upgrade, `delegatecall` or `selfdestruct` (opcode scan in the tests). No
   hardcoded chain addresses other than the dead address.
 * Delta accounting: fee claims are minted inside `afterSwap` for exactly the delta the PoolManager
-  credits the hook; outlets burn exactly what they spend; the buyback refunds any unspent budget.
+  credits the hook, then the donated portion is burned against `donate`'s debit. Outlets burn
+  what they spend; the buyback refunds unused budget and splits its internal fee from existing
+  claims. Its returned `spent` includes that fee, whose 10% burn share re-enters the burn bucket.
   The `CurrencyNotSettled` check in `unlock` guards every outlet path.
 * Reentrancy: the outlets run inside `poolManager.unlock`, which refuses nested unlocks, so a
   recipient cannot re-enter a swap or another outlet mid-flight. Buckets are zeroed before the
@@ -258,14 +288,18 @@ Checked against the `uniswap-v4-security` and `eth-security` references:
 * Oracle safety: the reference is a TWAP, never spot; observations are pre-swap; the window is a
   full hour from launch. The attack that remains is the one every TWAP has: holding the price down
   for an hour makes "down" the new normal, which is the brief's intended decay.
-* Known, accepted properties: exact-output sells are refused; `donate` pays whoever is in range when
-  called (JIT exposure, see Operational responsibilities); the buyback has no spot-slippage check
-  beyond the reference floor and the 1 ETH cap.
-* Tools run: `forge build`, `forge test` (88 tests, 256 fuzz runs per fuzz test), `forge fmt
-  --check`, plus the pinned protected hook and token floor suites executed locally against the real
-  creation code. Slither/Mythril were not available in this environment. Tests passing are not an
-  audit: the hook holds user-fee claims and moves funds, so an independent adversarial review is
-  required before release.
+* Integration limitations: exact-output sells and fee-bearing partial exact-input buys are refused.
+  The donation fallback retains JIT exposure; buybacks have a reference floor and a per-call cap,
+  with no block cap or spot floor. General anti-splitting remains unresolved, as explained above.
+* Revision checks: `forge build`, `forge test` with 256 runs per fuzz test, and `forge fmt --check`.
+  The three supplied proofs were copied unchanged to scratch and run before and after repairs.
+  The partial-buy proof passes after the repair. The JIT proof now fails its setup assertion
+  `donationBucket() > 0`, because the donation has already been paid; the replacement regression
+  checks both the attacker's lack of profit and the resident LP's receipt. The split proof still
+  demonstrates the specification conflict. Both disputes are recorded in `.imd-responses.json`.
+  Scratch proof copies are removed before the deliverable's full test run; pinned inputs are unchanged.
+  Slither/Mythril, chain forks, and deployment transactions were not run in this revision.
+  Independent review must resolve the disputed criteria before release.
 
 ## What the brief asked that the token does not do
 

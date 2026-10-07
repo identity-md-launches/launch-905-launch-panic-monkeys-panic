@@ -80,14 +80,14 @@ contract PanicHookOracleTest is PanicTestBase {
 
     function test_aCrashInThisBlockIsJudgedAgainstTheUntouchedReference() public {
         _nextBlock(12);
-        uint256 before = hook.totalAccruedFees();
+        uint256 before = _feesWithDonations();
         BalanceDelta d = _sellToDrawdown(2000);
-        uint256 fee = hook.totalAccruedFees() - before;
+        uint256 fee = _feesWithDonations() - before;
         assertEq(fee, _grossOutput(d, fee) * 2000 / 10_000);
         // A second seller in the same block faces the same reference and is now deeper.
-        before = hook.totalAccruedFees();
+        before = _feesWithDonations();
         d = _sellToDrawdown(3100);
-        fee = hook.totalAccruedFees() - before;
+        fee = _feesWithDonations() - before;
         assertEq(fee, _grossOutput(d, fee) * 3000 / 10_000);
     }
 
@@ -133,14 +133,14 @@ contract PanicHookOracleTest is PanicTestBase {
         assertEq(hook.referenceTick(), _tick(), "reference equals the flat price");
         assertEq(hook.currentDrawdownBps(), 0);
 
-        uint256 before = hook.totalAccruedFees();
+        uint256 before = _feesWithDonations();
         BalanceDelta d = _sellPanic(1 ether);
-        uint256 fee = hook.totalAccruedFees() - before;
+        uint256 fee = _feesWithDonations() - before;
         assertEq(fee, _grossOutput(d, fee) * 200 / 10_000, "base 2% sell fee again");
 
-        before = hook.totalAccruedFees();
+        before = _feesWithDonations();
         _buyPanic(1 ether);
-        assertEq(hook.totalAccruedFees(), before, "buys are free again");
+        assertEq(_feesWithDonations(), before, "buys are free again");
     }
 
     function test_panicTierStillAppliesBeforeTheHourIsUp() public {
@@ -150,9 +150,9 @@ contract PanicHookOracleTest is PanicTestBase {
         uint256 dd = hook.currentDrawdownBps();
         assertGe(dd, 900);
         assertLt(dd, 1200);
-        uint256 before = hook.totalAccruedFees();
+        uint256 before = _feesWithDonations();
         BalanceDelta d = _sellPanic(1 ether);
-        uint256 fee = hook.totalAccruedFees() - before;
+        uint256 fee = _feesWithDonations() - before;
         assertEq(fee, _grossOutput(d, fee) * 1000 / 10_000, "10% tier");
     }
 

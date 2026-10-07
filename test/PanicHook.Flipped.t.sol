@@ -18,10 +18,10 @@ abstract contract PanicHookErc20Base is PanicTestBase {
     }
 
     function test_sellTo20PercentDownPays20PercentInThePairedToken() public {
-        uint256 before = hook.totalAccruedFees();
+        uint256 before = _feesWithDonations();
         uint256 pairedBefore = _pairedToken().balanceOf(address(this));
         BalanceDelta d = _sellToDrawdown(2000);
-        uint256 fee = hook.totalAccruedFees() - before;
+        uint256 fee = _feesWithDonations() - before;
         uint256 dd = hook.currentDrawdownBps();
         assertGe(dd, 2000);
         assertLt(dd, 2010);
@@ -35,17 +35,17 @@ abstract contract PanicHookErc20Base is PanicTestBase {
 
     function test_buyWhileDownPays1PercentOfPairedInput() public {
         _sellToDrawdown(800);
-        uint256 before = hook.totalAccruedFees();
+        uint256 before = _feesWithDonations();
         uint256 pairedBefore = _pairedToken().balanceOf(address(this));
         _buyPanic(10 ether);
-        assertEq(hook.totalAccruedFees() - before, 0.1 ether);
+        assertEq(_feesWithDonations() - before, uint256(10 ether) * 100 / 10_100);
         assertEq(pairedBefore - _pairedToken().balanceOf(address(this)), 10 ether);
     }
 
     function test_buyWhileNotDownIsFree() public {
-        uint256 before = hook.totalAccruedFees();
+        uint256 before = _feesWithDonations();
         _buyPanic(10 ether);
-        assertEq(hook.totalAccruedFees(), before);
+        assertEq(_feesWithDonations(), before);
     }
 
     function test_outletsWorkWithAnErc20PairedToken() public {
@@ -57,8 +57,9 @@ abstract contract PanicHookErc20Base is PanicTestBase {
         hook.claimOracleFund();
         assertEq(_pairedToken().balanceOf(oracleFund), oracleAmount);
 
-        hook.donateToLiquidityProviders();
         assertEq(hook.donationBucket(), 0);
+        assertGt(hook.totalDonated(), 0);
+        _nextBlock(3600); // drain at a flat price; the dip buy fee is tested separately
 
         uint256 totalSpent;
         uint256 totalBurned;
