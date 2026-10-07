@@ -621,23 +621,21 @@ contract PanicHook is IHooks, IUnlockCallback {
         return (1e18 - ratioE18) / 1e14;
     }
 
-    /// @notice PANIC amount worth `pairedAmount` of the paired currency at the given sqrt price.
+    /// @notice PANIC amount worth `pairedAmount` of the paired currency at the given sqrt price, rounded down once.
     function pairedToPanicAtSqrtPrice(uint256 pairedAmount, uint160 sqrtPriceX96, bool panicIs0)
         public
         pure
         returns (uint256)
     {
-        if (panicIs0) {
-            // price1/0 = paired per PANIC: PANIC = paired * 2^192 / sqrtPrice^2
-            return FullMath.mulDiv(
-                FullMath.mulDiv(pairedAmount, FixedPoint96.Q96, sqrtPriceX96), FixedPoint96.Q96, sqrtPriceX96
-            );
-        }
-        // price1/0 = PANIC per paired: PANIC = paired * sqrtPrice^2 / 2^192
-        return
-            FullMath.mulDiv(
-                FullMath.mulDiv(pairedAmount, sqrtPriceX96, FixedPoint96.Q96), sqrtPriceX96, FixedPoint96.Q96
-            );
+        (uint256 num, uint256 den) =
+            panicIs0 ? (FixedPoint96.Q96, uint256(sqrtPriceX96)) : (uint256(sqrtPriceX96), FixedPoint96.Q96);
+        // Compute floor(pairedAmount * num^2 / den^2) without squaring a uint160 or losing the
+        // first division's remainder. With pairedAmount*num = q*den + r, the missing correction
+        // is floor(((q*num % den) + floor(r*num/den)) / den). Its numerator is < den + num,
+        // so it fits in 161 bits. Only the final fractional PANIC unit is discarded.
+        uint256 q = FullMath.mulDiv(pairedAmount, num, den);
+        uint256 r = mulmod(pairedAmount, num, den);
+        return FullMath.mulDiv(q, num, den) + (mulmod(q, num, den) + FullMath.mulDiv(r, num, den)) / den;
     }
 
     // ------------------------------------------------------------------------------------------------

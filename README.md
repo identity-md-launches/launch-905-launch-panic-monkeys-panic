@@ -91,8 +91,9 @@ three parts always sum to the fee exactly:
 
 The hook's claim balance always equals `oracleFundBucket + donationBucket + burnBucket`; the
 split allocates every minor unit, with no unassigned dust. `totalDonated` records the LP share
-already paid and is excluded from the claim balance and `totalAccruedFees()`. A buyback requires
-positive PANIC output and rounds its 98% minimum upward. Untradeably small burn balances stay
+already paid and is excluded from the claim balance and `totalAccruedFees()`. The reference-implied
+PANIC quote carries division remainders and rounds down only once, in either pool orientation.
+A buyback requires positive PANIC output and rounds its 98% minimum upward. Untradeably small burn balances stay
 accounted for until more fees accrue; wasting them on a zero-output swap is forbidden. Claim and
 donate impose no minimum amount.
 
@@ -264,6 +265,7 @@ evidence (including the explicitly unresolved requirement):
 | limited buys never pay fees on unfilled input | `test_partialDipBuyRevertsWithoutChargingOrMovingThePool`, `test_exactOutputLimitedDipBuyChargesOnlyRealisedInput`, `testFuzz_fullDipBuyFeeIsAtMostOnePercentOfPoolInput` |
 | historical LP fees cannot be captured by later JIT liquidity | `test_jitPositionCannotCaptureAnEarlierSwapsDonation`, `test_donationReachesTheLiquidityProviderOnWithdrawal` |
 | buyback dip fee and dust floor | `test_buybackCannotMoveTheReferenceAndPaysTheDipFee`, `test_partialBuybackReallocatesFeeOnlyOnRealisedInput`, `test_dustBuybackRevertsAndPreservesAllFunds`, `testFuzz_tinyBuybacksNeverRoundAwayTheReferenceFloor` |
+| reference quote preserves precision at dust amounts | `PanicHook.PriceMath.t.sol`: exact quote in both orientations, fuzz comparison to a single division, extreme prices, overflow refusal, and atomic rollback of the 13 wei buyback returning only 11 PANIC wei against a 12 wei minimum |
 | recipient that rejects ETH | `test_claimToARecipientThatRejectsEthFailsWithoutBlockingSwaps` |
 
 Tests read no environment variables and do not depend on the caller. They pass in any order and in
@@ -292,11 +294,12 @@ Checked against the `uniswap-v4-security` and `eth-security` references:
   The donation fallback retains JIT exposure; buybacks have a reference floor and a per-call cap,
   with no block cap or spot floor. General anti-splitting remains unresolved, as explained above.
 * Revision checks: `forge build`, `forge test` with 256 runs per fuzz test, and `forge fmt --check`.
-  The three supplied proofs were copied unchanged to scratch and run before and after repairs.
-  The partial-buy proof passes after the repair. The JIT proof now fails its setup assertion
-  `donationBucket() > 0`, because the donation has already been paid; the replacement regression
-  checks both the attacker's lack of profit and the resident LP's receipt. The split proof still
-  demonstrates the specification conflict. Both disputes are recorded in `.imd-responses.json`.
+  The supplied split proof was copied unchanged to scratch and reproduces the figures above.
+  It remains disputed because its general anti-splitting assertion conflicts with the exact
+  per-sell schedule. No sell economics were changed. The advisory dust reproduction initially
+  accepted 11 PANIC wei where the exact reference quote required 12; it now reverts with
+  `BuybackBelowReference(11, 12)`. Exact-output sell rejection was reproduced and retained as
+  the documented integration limitation. Every finding is answered in `.imd-responses.json`.
   Scratch proof copies are removed before the deliverable's full test run; pinned inputs are unchanged.
   Slither/Mythril, chain forks, and deployment transactions were not run in this revision.
   Independent review must resolve the disputed criteria before release.
